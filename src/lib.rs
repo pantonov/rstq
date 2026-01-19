@@ -1,12 +1,13 @@
 use ordhash::OrdHash;
 use std::{hash::Hash, time};
+use std::time::Instant;
 use std::sync::{Arc, atomic::Ordering, atomic::AtomicBool};
 use tokio::sync::Mutex;
 
 #[derive(Clone)]
 struct ExpValue<V> {
     value: V,
-    expireat: time::SystemTime,
+    expireat: Instant,
 }
 
 #[derive(Clone)]
@@ -33,12 +34,12 @@ impl<K: Eq + Hash + Clone + Send, V: Clone + Send, F: Fn(K, V) + Clone + Send> T
     pub fn reserve(&self, additional: usize) {
         self.inner.blocking_lock().reserve(additional);
     }
-    // if this method returns true, must run expire_loop in a separate thread
+    // push entry into the queue, spawn processing task if needed
     pub fn push(&self, key: K, value: V) 
         where Self: 'static {
         let expvalue = ExpValue {
             value,
-            expireat: time::SystemTime::now() + self.timeout,
+            expireat: Instant::now() + self.timeout,
         };
         self.inner.blocking_lock().push_back(key, expvalue);
         if self.running.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
@@ -63,15 +64,22 @@ impl<K: Eq + Hash + Clone + Send, V: Clone + Send, F: Fn(K, V) + Clone + Send> T
     // task which runs expiration loop, terminates when queue is empty
     async fn expire_loop(self) { 
         let mut inner = self.inner.lock().await;
-        while let Some((key, ev)) = inner.pop_front() {
-            drop(inner);
-            let now = time::SystemTime::now();
-            if ev.expireat > now {
-                tokio::time::sleep(ev.expireat.duration_since(now).unwrap()).await;
+        loop {
+            match inner.pop_front() {
+                Some((key, ev)) => {
+                    drop(inner);
+                    let now = Instant::now();
+                    if ev.expireat > now {
+                        tokio::time::sleep(ev.expireat.duration_since(now)).await;
+                    }
+                    (self.expfunc)(key, ev.value);
+                    inner = self.inner.lock().await;
+                }
+                None => {
+                    self.running.store(false, Ordering::Release);
+                    return;
+                }
             }
-            (self.expfunc)(key, ev.value);
-            inner = self.inner.lock().await;
         }
-        self.running.store(false, Ordering::Release);
     }
 }
